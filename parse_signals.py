@@ -1,126 +1,97 @@
 """
-Check the channel's results against real Bybit prices.
-Replays every signal in signals.json on 1 minute candles with the same rules as bot.py:
-market entry after the post, equal split across targets, stop loss moves to entry after TP1.
-If the stop loss and a target sit in the same candle, the stop loss counts first.
+Parser for A. Pierce Capital channel posts.
 
-Run:  python verify.py [signals.json] [from_date YYYY-MM-DD]
-Needs internet access to api.bybit.com (set BYBIT_HOST=https://api.bytick.com if blocked).
+parse_signal_text(text) -> dict | None
+    None  : the message is not a trade signal at all (chatter, results, etc.)
+    dict  : coin, symbol, side, entry, sl, targets, valid, reason
+            valid=False means it looked like a signal but the numbers don't add up,
+            so bot.py should skip it instead of trading it.
+
+Rebuild signals.json from history.jsonl:
+    python parse_signals.py [history.jsonl] [out.json]
 """
-import csv, json, os, sys, time, urllib.parse, urllib.request
-from datetime import datetime, timezone
+import json, re, sys
 
-HOST = os.getenv("BYBIT_HOST", "https://api.bybit.com")
-DELAY_MIN = int(os.getenv("DELAY_MIN", "1"))        # minutes between post and entry
-MAX_DAYS = int(os.getenv("MAX_DAYS", "7"))
-MAX_CHASE_PCT = float(os.getenv("MAX_CHASE_PCT", "0.3"))
-TAKER, MAKER = 0.00055, 0.0002
-
-
-def fetch_bars(symbol, start_ms, end_ms):
-    rows, cur_end = [], end_ms
-    while True:
-        q = urllib.parse.urlencode(dict(category="linear", symbol=symbol, interval="1",
-                                        start=start_ms, end=cur_end, limit=1000))
-        with urllib.request.urlopen(f"{HOST}/v5/market/kline?{q}", timeout=20) as r:
-            data = json.load(r)
-        if data.get("retCode") != 0:
-            raise RuntimeError(data.get("retMsg"))
-        batch = data["result"]["list"]
-        if not batch:
-            break
-        rows += batch
-        oldest = int(batch[-1][0])
-        if oldest <= start_ms or len(batch) < 1000:
-            break
-        cur_end = oldest - 1
-        time.sleep(0.15)
-    bars = sorted({int(r[0]): (int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4])) for r in rows}.values())
-    return bars
+HEAD = re.compile(r"^\W*([A-Z0-9]{2,15})\s*[\u2013\u2014\-]+\s*(LONG|SHORT)\b", re.I | re.M)
+NUM = r"(\d+(?:[.,]\d+)?)"
+ENTRY = re.compile(r"Entry\s*:?\s*" + NUM, re.I)
+SL = re.compile(r"Stop\s*Loss\s*:?\s*" + NUM, re.I)
+TARGETS = re.compile(r"Targets?\s*:?\s*((?:" + NUM + r"[\s/,]*)+)", re.I)   # one per line, or 1 / 2 / 3
 
 
-def simulate(sig, bars):
-    """bars: ascending (t, o, h, l, c), first bar is the entry bar. Returns dict."""
-    long = sig["side"] == "long"
-    d = 1 if long else -1
-    entry, sl, tps = bars[0][1], sig["sl"], sig["targets"]
-    chase = d * (entry - sig["entry"]) / sig["entry"] * 100
-    if chase > MAX_CHASE_PCT:
-        return dict(outcome="SKIP chase", tp_hits=0, R=0.0, R_net=0.0, entry=entry)
-    if d * (entry - sl) <= 0:
-        return dict(outcome="SKIP past stop", tp_hits=0, R=0.0, R_net=0.0, entry=entry)
-    risk = abs(entry - sl)
-    n, w = len(tps), 1.0 / len(tps)
-    stop, hits, rem, pnl, fee, label = sl, 0, 1.0, 0.0, TAKER, "OPEN"
-    for t, o, h, l, c in bars:
-        if d * (l - stop) <= 0 if long else d * (h - stop) <= 0:
-            pnl += rem * d * (stop - entry)
-            fee += rem * TAKER
-            label, rem = ("SL" if hits == 0 else f"BE after TP{hits}"), 0.0
-            break
-        while hits < n and (h >= tps[hits] if long else l <= tps[hits]):
-            pnl += w * d * (tps[hits] - entry)
-            fee += w * MAKER
-            rem -= w
-            hits += 1
-            if hits == 1:
-                stop = entry
-        if hits == n:
-            label, rem = "ALL targets", 0.0
-            break
-    if rem > 1e-9:                                   # still open at the end of the window
-        pnl += rem * d * (bars[-1][4] - entry)
-        fee += rem * TAKER
-        label = f"OPEN after TP{hits}" if hits else "OPEN"
-    R = pnl / risk
-    R_net = R - fee * entry / risk
-    return dict(outcome=label, tp_hits=hits, R=R, R_net=R_net, entry=entry)
+def _f(s):
+    return float(s.replace(",", "."))
 
 
-def main(path="signals.json", since="2000-01-01"):
-    if path[:2] == "20" and path[4:5] == "-":     # a date was passed alone
-        path, since = "signals.json", path
-    sigs = [s for s in json.load(open(path)) if s["valid"] and not s["duplicate"] and s["date"][:10] >= since]
-    now_ms = int(time.time() * 1000)
-    out = []
-    for s in sigs:
-        t0 = int(datetime.fromisoformat(s["date"]).timestamp() * 1000) + DELAY_MIN * 60000
-        t1 = min(t0 + MAX_DAYS * 86400000, now_ms)
-        try:
-            bars = fetch_bars(s["symbol"], t0, t1)
-            bars = [b for b in bars if b[0] >= t0]
-            if not bars:
-                raise RuntimeError("no candles")
-            r = simulate(s, bars)
-        except Exception as ex:
-            r = dict(outcome=f"NO DATA ({ex})", tp_hits=0, R=0.0, R_net=0.0, entry=0)
-        kinds = {c["kind"] for c in s.get("claims", [])}
-        claimed = "win" if kinds & {"TP", "ALL_TP", "OTHER"} else "stop" if "SL" in kinds else "none"
-        out.append({**{k: s[k] for k in ("id", "date", "symbol", "side")}, **r, "claimed": claimed})
-        print(f"{s['date'][:16]} {s['symbol']:<10}{s['side']:<6}{r['outcome']:<18} TPs={r['tp_hits']} netR={r['R_net']:+.2f} claimed={claimed}", flush=True)
+def parse_signal_text(text):
+    text = text or ""
+    h = HEAD.search(text)
+    e, s = ENTRY.search(text), SL.search(text)
+    if not (h and e and s):
+        return None
+    coin, side = h.group(1).upper(), h.group(2).lower()
+    t = TARGETS.search(text)
+    targets = [_f(x) for x in re.findall(NUM, t.group(1))] if t else []
+    sig = dict(coin=coin, symbol=coin + "USDT", side=side,
+               entry=_f(e.group(1)), sl=_f(s.group(1)), targets=targets,
+               valid=True, reason="")
+    entry, sl, long = sig["entry"], sig["sl"], side == "long"
+    if not targets:
+        return {**sig, "valid": False, "reason": "no targets found"}
+    if (long and not sl < entry) or (not long and not sl > entry):
+        return {**sig, "valid": False, "reason": "stop loss is on the wrong side of entry"}
+    ordered = all((b > a) if long else (b < a) for a, b in zip([entry] + targets, targets))
+    if not ordered:
+        return {**sig, "valid": False, "reason": "targets are not in order away from entry"}
+    return sig
 
-    ok = [o for o in out if not o["outcome"].startswith(("SKIP", "NO DATA"))]
-    sl = [o for o in ok if o["outcome"] == "SL"]
-    tp1 = [o for o in ok if o["tp_hits"] >= 1]
-    print("\n--- summary ---")
-    print(f"signals {len(out)}  simulated {len(ok)}  skipped {sum(o['outcome'].startswith('SKIP') for o in out)}  no data {sum(o['outcome'].startswith('NO DATA') for o in out)}")
-    if ok:
-        print(f"stopped out before TP1: {len(sl)}   reached TP1: {len(tp1)} ({len(tp1) / len(ok):.0%})")
-        print(f"total R gross {sum(o['R'] for o in ok):+.1f}   net of fees {sum(o['R_net'] for o in ok):+.1f}   avg net R per trade {sum(o['R_net'] for o in ok) / len(ok):+.3f}")
-    bad = [o for o in ok if o["claimed"] == "win" and o["tp_hits"] == 0]
-    print(f"\nchannel claimed a win but price never reached TP1 first: {len(bad)}")
-    for o in bad:
-        print("  ", o["date"][:16], o["symbol"], o["side"], o["outcome"])
-    silent = [o for o in ok if o["claimed"] == "none" and o["tp_hits"] == 0]
-    print(f"no claim linked and price did not reach TP1 (check for unreported stops): {len(silent)}")
-    for o in silent:
-        print("  ", o["date"][:16], o["symbol"], o["side"], o["outcome"])
-    with open("verify_results.csv", "w", newline="") as f:
-        wr = csv.DictWriter(f, fieldnames=list(out[0].keys()))
-        wr.writeheader()
-        wr.writerows(out)
-    print("\nSaved verify_results.csv")
+
+# ---- channel follow-up messages (win / stop claims) -------------------------
+
+ORD = {"first": 1, "1st": 1, "second": 2, "2nd": 2, "third": 3, "3rd": 3, "fourth": 4}
+
+
+def classify_claim(text):
+    t = (text or "").lower()
+    if "almost" in t:                       # "almost took the target" is not a win claim
+        return None
+    if re.search(r"stop\s*loss|stopped|\bsl\b|missed", t) and not re.search(r"first (tp|target|take)", t.split("missed")[0]):
+        return dict(kind="SL", n=None)
+    m = re.search(r"tp\s*#?\s*(\d)", t)
+    if m:
+        return dict(kind="TP", n=int(m.group(1)))
+    m = re.search(r"\b(first|second|third|fourth|1st|2nd|3rd)\b[^.\n]{0,20}(tp|take profit|target)", t)
+    if m:
+        return dict(kind="TP", n=ORD[m.group(1)])
+    m = re.search(r"(first|second|third)\s+(target|tp)", t)
+    if m:
+        return dict(kind="TP", n=ORD[m.group(1)])
+    if re.search(r"target|\btp\b|take profit", t):
+        return dict(kind="OTHER", n=None)
+    return None
+
+
+def build(history_path="history.jsonl", out_path="signals.json"):
+    rows = [json.loads(l) for l in open(history_path, encoding="utf-8") if l.strip()]
+    rows.sort(key=lambda r: r["id"])
+    sigs, seen = {}, set()
+    for r in rows:
+        p = parse_signal_text(r["text"])
+        if p:
+            key = (p["symbol"], p["side"], p["entry"], p["sl"])
+            p.update(id=r["id"], date=r["date"], duplicate=key in seen, claims=[])
+            seen.add(key)
+            sigs[r["id"]] = p
+    for r in rows:
+        tgt = sigs.get(r["reply_to"])
+        c = classify_claim(r["text"]) if tgt else None
+        if c:
+            tgt["claims"].append(dict(**c, id=r["id"], date=r["date"], text=(r["text"] or "")[:200]))
+    out = sorted(sigs.values(), key=lambda s: s["date"], reverse=True)
+    json.dump(out, open(out_path, "w", encoding="utf-8"), indent=1, ensure_ascii=False)
+    return out
 
 
 if __name__ == "__main__":
-    main(*sys.argv[1:])
+    out = build(*sys.argv[1:3])
+    print(f"{len(out)} signals, {sum(s['valid'] for s in out)} valid, {sum(s['duplicate'] for s in out)} duplicates")
