@@ -16,7 +16,7 @@ from parse_signals import parse_signal_text
 load_dotenv()
 KEYWORD = os.getenv("CHANNEL_KEYWORD", "A. Pierce Capital").lower()
 MODE = os.getenv("BYBIT_MODE", "demo").lower()          # demo | testnet | live
-RISK_USD = float(os.getenv("RISK_USD", "10"))            # loss if stop loss hits
+RISK_USD = float(os.getenv("RISK_USD", "2"))            # loss if stop loss hits
 LEVERAGE = float(os.getenv("LEVERAGE", "10"))
 MAX_NOTIONAL_USD = float(os.getenv("MAX_NOTIONAL_USD", "500"))
 MAX_CHASE_PCT = float(os.getenv("MAX_CHASE_PCT", "0.3")) # skip if price ran this far past entry
